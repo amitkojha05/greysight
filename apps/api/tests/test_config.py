@@ -144,3 +144,23 @@ def test_estimated_credit_price_empty_env_uses_default(
     settings = Settings()
 
     assert settings.estimated_credit_price_usd == 3.0
+
+
+def test_auth_cache_ttl_defaults_to_thirty_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GREYSIGHT_AUTH_CACHE_TTL_SECONDS", raising=False)
+
+    settings = Settings()
+
+    assert settings.auth_cache_ttl_seconds == 30.0
+
+
+def test_auth_cache_ttl_is_read_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GREYSIGHT_AUTH_CACHE_TTL_SECONDS", "12.5")
+
+    settings = Settings()
+
+    assert settings.auth_cache_ttl_seconds == 12.5
