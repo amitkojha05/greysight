@@ -1,0 +1,1094 @@
+diff --git a/README.md b/README.md
+index c034543..de01805 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,9 @@ Or run it yourself: using the quick start below.
+ 
+ - **Cost observability:** Attribute Snowflake spend, inspect warehouse and query
+   costs, and review usage trends from one dashboard.
++- **Waste estimator:** Dollarizes per-warehouse idle compute and projects
++  monthly recoverable spend. See
++  [docs/warehouse-waste-estimator.md](docs/warehouse-waste-estimator.md).
+ - **Auto Savings:** Reduce idle compute by suspending active warehouses that have no running queries.
+ 
+ ## Quick start
+@@ -169,6 +172,7 @@ credentials.
+ - [Snowflake setup](docs/snowflake-setup.md)
+ - [How Auto Savings works](docs/automated-savings-how-it-works.md)
+ - [Auto Savings operations guide](docs/automated-savings.md)
++- [Warehouse waste estimator](docs/warehouse-waste-estimator.md)
+ - [Security model](docs/security-model.md)
+ - [Deployment](docs/deployment.md)
+ - [Dependency compatibility](docs/dependency-compatibility.md)
+diff --git a/apps/api/app/services/cost_metrics.py b/apps/api/app/services/cost_metrics.py
+index fa800e6..f0c58ed 100644
+--- a/apps/api/app/services/cost_metrics.py
++++ b/apps/api/app/services/cost_metrics.py
+@@ -23,6 +23,16 @@ class WarehouseSpendDaily(BaseModel):
+     credits_used_compute: float = 0.0
+ 
+ 
++class WarehouseSpendDailyWithAttribution(WarehouseSpendDaily):
++    credits_attributed_queries: float | None = None
++
++
++class WarehouseWasteEstimate(BaseModel):
++    warehouse_name: str
++    idle_credits: float
++    idle_pct: float | None
++
++
+ class DatabaseStorageDaily(BaseModel):
+     usage_date: date
+     database_name: str | None = None
+@@ -144,7 +154,12 @@ def _top_warehouse_name(credits_by_warehouse: dict[str, float]) -> str | None:
+ 
+ 
+ def _filter_complete_window[
+-    T: AccountSpendDaily | WarehouseSpendDaily | DatabaseStorageDaily,
++    T: (
++        AccountSpendDaily
++        | WarehouseSpendDaily
++        | WarehouseSpendDailyWithAttribution
++        | DatabaseStorageDaily
++    ),
+ ](
+     rows: list[T],
+     *,
+@@ -179,3 +194,89 @@ def _latest_complete_storage_bytes(
+         for row in complete_rows
+         if row.usage_date == latest_usage_date
+     )
++
++
++def estimate_warehouse_waste(
++    warehouse_spend_daily: list[WarehouseSpendDaily | dict[str, Any]],
++    *,
++    current_usage_date: date,
++    window_days: int,
++) -> list[WarehouseWasteEstimate]:
++    """Per-warehouse recoverable idle credits over the complete billing window.
++
++    ``idle = credits_used_compute - credits_attributed_queries`` (mirrors
++    ``_warehouse_idle_pct`` in ``dashboard_view_builder``). Any row missing
++    ``credits_attributed_queries`` (adaptive warehouses on old Account Usage
++    schemas) collapses the whole warehouse's ``idle_pct`` to ``None`` —
++    partial attribution is less honest than an em dash.
++
++    Returns rows sorted by ``idle_credits`` descending, then warehouse name
++    ascending for stable output. Warehouses with zero compute in the window
++    are dropped — they cannot waste what they did not spend.
++
++    Fail-loud: ``compute < 0`` or ``attributed > compute + eps`` raise, matching
++    ``_warehouse_row_dollars``. Never silently clamp real negatives.
++    """
++    complete_start, complete_end = _complete_window_bounds(
++        current_usage_date=current_usage_date,
++        window_days=window_days,
++    )
++    rows = [
++        WarehouseSpendDailyWithAttribution.model_validate(row)
++        for row in warehouse_spend_daily
++    ]
++    rows = _filter_complete_window(
++        rows,
++        start_date=complete_start,
++        end_date=complete_end,
++    )
++
++    compute_by_wh: dict[str, float] = defaultdict(float)
++    attributed_by_wh: dict[str, float | None] = {}
++    for row in rows:
++        if row.credits_used_compute < 0.0:
++            raise ValueError(
++                "warehouse_spend_daily credits_used_compute must be >= 0"
++            )
++        compute_by_wh[row.warehouse_name] += row.credits_used_compute
++        current = attributed_by_wh.get(row.warehouse_name, 0.0)
++        if current is None or row.credits_attributed_queries is None:
++            attributed_by_wh[row.warehouse_name] = None
++        else:
++            attributed_by_wh[row.warehouse_name] = (
++                current + row.credits_attributed_queries
++            )
++
++    estimates: list[WarehouseWasteEstimate] = []
++    for warehouse_name, compute in compute_by_wh.items():
++        if compute <= 0.0:
++            continue
++        attributed = attributed_by_wh.get(warehouse_name)
++        if attributed is None:
++            estimates.append(
++                WarehouseWasteEstimate(
++                    warehouse_name=warehouse_name,
++                    idle_credits=0.0,
++                    idle_pct=None,
++                )
++            )
++            continue
++        idle = compute - attributed
++        _EPS = 1e-9
++        if idle < -_EPS:
++            raise ValueError(
++                "warehouse_spend_daily credits_used_compute must be "
++                ">= credits_attributed_queries"
++            )
++        idle = max(idle, 0.0)
++        estimates.append(
++            WarehouseWasteEstimate(
++                warehouse_name=warehouse_name,
++                idle_credits=idle,
++                idle_pct=idle / compute,
++            )
++        )
++    return sorted(
++        estimates,
++        key=lambda est: (-est.idle_credits, est.warehouse_name),
++    )
+diff --git a/apps/api/app/services/dashboard_view_builder.py b/apps/api/app/services/dashboard_view_builder.py
+index c36561b..7e21b77 100644
+--- a/apps/api/app/services/dashboard_view_builder.py
++++ b/apps/api/app/services/dashboard_view_builder.py
+@@ -35,6 +35,8 @@ from app.services.dashboard_view_models import (
+     WarehouseIdleBarRow,
+     WarehousePoint,
+     WarehouseSpendViewModel,
++    WarehouseWasteRow,
++    WarehouseWasteViewModel,
+ )
+ 
+ DEFAULT_VIEW_WINDOW_DAYS = 30
+@@ -438,6 +440,13 @@ def _build_dashboard_view_for_ranges(
+         currency=currency,
+         convert=convert,
+     )
++    warehouse_waste = _build_warehouse_waste(
++        warehouse_rows=warehouse_rows,
++        basis=basis,
++        currency=currency,
++        convert=convert,
++        view_range=view_range,
++    )
+     storage_rates = _build_storage_rate_index(
+         _dataset_rows(datasets, "rate_sheet_daily")
+     )
+@@ -491,6 +500,7 @@ def _build_dashboard_view_for_ranges(
+         capacity_balance=capacity_balance,
+         total_spend=total_spend,
+         warehouse_spend=warehouse_spend,
++        warehouse_waste=warehouse_waste,
+         storage_spend=storage_spend,
+         service_spend=service_spend,
+         detail_tables=DetailTablesViewModel(
+@@ -692,6 +702,7 @@ def _empty_dashboard_view(
+         capacity_balance=_empty_capacity_balance(currency),
+         total_spend=_empty_total_spend(currency),
+         warehouse_spend=_empty_warehouse_spend(currency),
++        warehouse_waste=_empty_warehouse_waste(currency),
+         storage_spend=_empty_storage_spend(currency),
+         service_spend=_empty_service_spend(),
+         detail_tables=DetailTablesViewModel(
+@@ -749,6 +760,18 @@ def _empty_warehouse_spend(currency: str) -> WarehouseSpendViewModel:
+     )
+ 
+ 
++def _empty_warehouse_waste(currency: str) -> WarehouseWasteViewModel:
++    return WarehouseWasteViewModel(
++        basis="estimated",
++        total_period_idle_spend=0.0,
++        total_period_idle_spend_label=_format_currency(0.0, currency),
++        total_projected_monthly_idle_spend=0.0,
++        total_projected_monthly_idle_spend_label=_format_currency(0.0, currency),
++        rows=[],
++        is_empty=True,
++    )
++
++
+ def _empty_storage_spend(currency: str) -> StorageSpendViewModel:
+     return StorageSpendViewModel(
+         basis="estimated",
+@@ -1321,6 +1344,114 @@ def _build_warehouse_spend(
+     )
+ 
+ 
++WASTE_TABLE_ROW_LIMIT = 5
++
++
++def _build_warehouse_waste(
++    *,
++    warehouse_rows: list[DatasetRow],
++    basis: SpendBasis,
++    currency: str,
++    convert: ConvertCredits,
++    view_range: DashboardViewRange,
++) -> WarehouseWasteViewModel:
++    """Per-warehouse recoverable idle spend, dollarized and projected monthly.
++
++    Idle credits are re-derived here (not imported from cost_metrics) because
++    the view builder already owns per-row ``convert`` — running the credits
++    through the same rate index that priced ``warehouse_spend`` keeps the two
++    sections dollar-consistent to the cent.
++    """
++    compute_by_wh: dict[str, float] = {}
++    attributed_by_wh: dict[str, float | None] = {}
++    idle_dollars_by_wh: dict[str, float] = {}
++    for row in warehouse_rows:
++        warehouse_name = _string_field(row, "warehouse_name", "Unknown warehouse")
++        usage_date = _as_date(row["usage_date"])
++        compute_credits = _required_float_field(
++            row, "warehouse_spend_daily", "credits_used_compute"
++        )
++        if compute_credits < 0.0:
++            raise ValueError(
++                "warehouse_spend_daily credits_used_compute must be >= 0"
++            )
++        attributed = _required_nullable_float_field(
++            row, "warehouse_spend_daily", "credits_attributed_queries"
++        )
++        compute_by_wh[warehouse_name] = (
++            compute_by_wh.get(warehouse_name, 0.0) + compute_credits
++        )
++        current_attributed = attributed_by_wh.get(warehouse_name, 0.0)
++        if current_attributed is None or attributed is None:
++            attributed_by_wh[warehouse_name] = None
++        else:
++            attributed_by_wh[warehouse_name] = current_attributed + attributed
++
++        if attributed is not None:
++            idle_credits_row = compute_credits - attributed
++            if idle_credits_row < -_FLOAT_EPSILON:
++                raise ValueError(
++                    "warehouse_spend_daily credits_used_compute must be "
++                    ">= credits_attributed_queries"
++                )
++            idle_credits_row = max(idle_credits_row, 0.0)
++            idle_dollars_by_wh[warehouse_name] = idle_dollars_by_wh.get(
++                warehouse_name, 0.0
++            ) + convert(
++                idle_credits_row,
++                usage_date,
++                "WAREHOUSE_METERING",
++                "COMPUTE",
++            )
++
++    day_count = (view_range.end_date - view_range.start_date).days + 1
++    monthly_multiplier = 30.0 / day_count if day_count > 0 else 0.0
++
++    rows: list[WarehouseWasteRow] = []
++    for warehouse_name, compute in compute_by_wh.items():
++        if compute <= 0.0:
++            continue
++        attributed = attributed_by_wh.get(warehouse_name)
++        if attributed is None:
++            idle_pct = None
++            period_idle = 0.0
++        else:
++            idle_credits = max(compute - attributed, 0.0)
++            idle_pct = idle_credits / compute
++            period_idle = idle_dollars_by_wh.get(warehouse_name, 0.0)
++        projected_monthly = period_idle * monthly_multiplier
++        rows.append(
++            WarehouseWasteRow(
++                name=warehouse_name,
++                idle_pct=idle_pct,
++                period_idle_spend=period_idle,
++                period_idle_spend_label=_format_currency(period_idle, currency),
++                projected_monthly_idle_spend=projected_monthly,
++                projected_monthly_idle_spend_label=_format_currency(
++                    projected_monthly, currency
++                ),
++            )
++        )
++    rows.sort(key=lambda waste_row: (-waste_row.period_idle_spend, waste_row.name))
++    rows = rows[:WASTE_TABLE_ROW_LIMIT]
++
++    total_period = sum(waste_row.period_idle_spend for waste_row in rows)
++    total_monthly = sum(
++        waste_row.projected_monthly_idle_spend for waste_row in rows
++    )
++    return WarehouseWasteViewModel(
++        basis=basis,
++        total_period_idle_spend=total_period,
++        total_period_idle_spend_label=_format_currency(total_period, currency),
++        total_projected_monthly_idle_spend=total_monthly,
++        total_projected_monthly_idle_spend_label=_format_currency(
++            total_monthly, currency
++        ),
++        rows=rows,
++        is_empty=total_period <= 0.0,
++    )
++
++
+ def _build_storage_spend(
+     *,
+     dates: list[date],
+diff --git a/apps/api/app/services/dashboard_view_models.py b/apps/api/app/services/dashboard_view_models.py
+index 253ae22..0273d7b 100644
+--- a/apps/api/app/services/dashboard_view_models.py
++++ b/apps/api/app/services/dashboard_view_models.py
+@@ -134,6 +134,25 @@ class WarehouseSpendViewModel(BaseModel):
+     is_empty: bool
+ 
+ 
++class WarehouseWasteRow(BaseModel):
++    name: str
++    idle_pct: float | None
++    period_idle_spend: float
++    period_idle_spend_label: str
++    projected_monthly_idle_spend: float
++    projected_monthly_idle_spend_label: str
++
++
++class WarehouseWasteViewModel(BaseModel):
++    basis: SpendBasis
++    total_period_idle_spend: float
++    total_period_idle_spend_label: str
++    total_projected_monthly_idle_spend: float
++    total_projected_monthly_idle_spend_label: str
++    rows: list[WarehouseWasteRow]
++    is_empty: bool
++
++
+ class StorageDatabaseRow(BaseModel):
+     name: str
+     bytes: float
+@@ -202,6 +221,15 @@ class DashboardViewResponse(BaseModel):
+     capacity_balance: CapacityBalanceViewModel
+     total_spend: TotalSpendViewModel
+     warehouse_spend: WarehouseSpendViewModel
++    warehouse_waste: WarehouseWasteViewModel = WarehouseWasteViewModel(
++        basis="estimated",
++        total_period_idle_spend=0.0,
++        total_period_idle_spend_label="$0.00",
++        total_projected_monthly_idle_spend=0.0,
++        total_projected_monthly_idle_spend_label="$0.00",
++        rows=[],
++        is_empty=True,
++    )
+     storage_spend: StorageSpendViewModel
+     service_spend: ServiceSpendViewModel
+     detail_tables: DetailTablesViewModel
+diff --git a/apps/api/tests/test_cost_metrics.py b/apps/api/tests/test_cost_metrics.py
+index 2675e16..b11cdbe 100644
+--- a/apps/api/tests/test_cost_metrics.py
++++ b/apps/api/tests/test_cost_metrics.py
+@@ -4,9 +4,10 @@ import pytest
+ 
+ from app.services.cost_metrics import (
+     AccountSpendDaily,
++    WarehouseSpendDaily,
+     build_dashboard_summary,
+     derive_account_spend_daily,
+-    WarehouseSpendDaily,
++    estimate_warehouse_waste,
+ )
+ 
+ 
+@@ -300,3 +301,67 @@ def test_build_dashboard_summary_excludes_rows_outside_trailing_complete_window(
+     assert summary.estimated_monthly_credits == 300.0
+     assert summary.warehouse_count == 1
+     assert summary.top_warehouse_name == "BI_WH"
++
++
++def test_estimate_warehouse_waste_ranks_by_idle_credits_desc() -> None:
++    rows = [
++        {
++            "usage_date": date(2026, 6, 1),
++            "warehouse_name": "A",
++            "credits_used": 108.0,
++            "credits_used_compute": 100.0,
++            "credits_attributed_queries": 25.0,
++        },
++        {
++            "usage_date": date(2026, 6, 1),
++            "warehouse_name": "B",
++            "credits_used": 54.0,
++            "credits_used_compute": 50.0,
++            "credits_attributed_queries": 30.0,
++        },
++    ]
++    result = estimate_warehouse_waste(
++        rows,
++        current_usage_date=date(2026, 6, 2),
++        window_days=1,
++    )
++    assert [row.warehouse_name for row in result] == ["A", "B"]
++    assert result[0].idle_credits == pytest.approx(75.0)
++    assert result[0].idle_pct == pytest.approx(0.75)
++
++
++def test_estimate_warehouse_waste_null_attribution_yields_none_pct() -> None:
++    rows = [
++        {
++            "usage_date": date(2026, 6, 1),
++            "warehouse_name": "ADAPT",
++            "credits_used": 20.0,
++            "credits_used_compute": 20.0,
++            "credits_attributed_queries": None,
++        },
++    ]
++    result = estimate_warehouse_waste(
++        rows,
++        current_usage_date=date(2026, 6, 2),
++        window_days=1,
++    )
++    assert result[0].idle_pct is None
++    assert result[0].idle_credits == 0.0
++
++
++def test_estimate_warehouse_waste_raises_when_attribution_exceeds_compute() -> None:
++    rows = [
++        {
++            "usage_date": date(2026, 6, 1),
++            "warehouse_name": "X",
++            "credits_used": 20.0,
++            "credits_used_compute": 10.0,
++            "credits_attributed_queries": 15.0,
++        }
++    ]
++    with pytest.raises(ValueError, match="credits_used_compute"):
++        estimate_warehouse_waste(
++            rows,
++            current_usage_date=date(2026, 6, 2),
++            window_days=1,
++        )
+diff --git a/apps/api/tests/test_dashboard_view_builder.py b/apps/api/tests/test_dashboard_view_builder.py
+index 755195b..1a34c3a 100644
+--- a/apps/api/tests/test_dashboard_view_builder.py
++++ b/apps/api/tests/test_dashboard_view_builder.py
+@@ -11,14 +11,15 @@ from app.services.dashboard_view_builder import (
+     DashboardRangeOutOfBoundsError,
+     _build_capacity_balance,
+     _build_forecast_series,
+-    _trailing_average_spend,
+     _build_rate_index,
+     _build_storage_rate_index,
++    _build_warehouse_waste,
+     _credits_to_dollars,
+     _format_bytes,
+     _format_currency,
+     _rate_key,
+     _storage_price_for,
++    _trailing_average_spend,
+     _warehouse_idle_pct,
+     _warehouse_row_dollars,
+     build_dashboard_view,
+@@ -2285,3 +2286,116 @@ def test_warehouse_bars_reject_missing_attribution_field() -> None:
+             start_date=date(2026, 6, 8),
+             end_date=date(2026, 6, 8),
+         )
++
++
++def _waste_convert(
++    credits: float,
++    usage_date: date,
++    service_type: str,
++    rating_type: str | None = None,
++) -> float:
++    del usage_date, service_type, rating_type
++    return credits * 2.0
++
++
++def test_warehouse_waste_dollarizes_via_rate_index() -> None:
++    view_range = DashboardViewRange(
++        mode="custom",
++        window_days=None,
++        start_date=date(2026, 6, 1),
++        end_date=date(2026, 6, 10),
++    )
++    model = _build_warehouse_waste(
++        warehouse_rows=[
++            {
++                "usage_date": date(2026, 6, 1),
++                "warehouse_name": "A",
++                "credits_used": 108.0,
++                "credits_used_compute": 100.0,
++                "credits_attributed_queries": 25.0,
++            },
++            {
++                "usage_date": date(2026, 6, 1),
++                "warehouse_name": "B",
++                "credits_used": 54.0,
++                "credits_used_compute": 50.0,
++                "credits_attributed_queries": 30.0,
++            },
++        ],
++        basis="estimated",
++        currency="USD",
++        convert=_waste_convert,
++        view_range=view_range,
++    )
++    # Window is 10 days, so monthly multiplier is 30/10 = 3.
++    # A idle credits 75 * $2 = $150 period, $450 monthly.
++    # B idle credits 20 * $2 = $40 period, $120 monthly.
++    assert [row.name for row in model.rows] == ["A", "B"]
++    assert model.rows[0].period_idle_spend == pytest.approx(150.0)
++    assert model.rows[0].projected_monthly_idle_spend == pytest.approx(450.0)
++    assert model.rows[0].idle_pct == pytest.approx(0.75)
++    assert model.rows[1].period_idle_spend == pytest.approx(40.0)
++    assert model.rows[1].projected_monthly_idle_spend == pytest.approx(120.0)
++    assert model.total_period_idle_spend == pytest.approx(190.0)
++    assert model.total_projected_monthly_idle_spend == pytest.approx(570.0)
++    assert model.is_empty is False
++
++
++def test_warehouse_waste_caps_rows_at_five() -> None:
++    view_range = DashboardViewRange(
++        mode="custom",
++        window_days=None,
++        start_date=date(2026, 6, 1),
++        end_date=date(2026, 6, 1),
++    )
++    warehouse_rows = [
++        {
++            "usage_date": date(2026, 6, 1),
++            "warehouse_name": f"WH{index}",
++            "credits_used": float(100 - index * 10),
++            "credits_used_compute": float(100 - index * 10),
++            "credits_attributed_queries": 0.0,
++        }
++        for index in range(8)
++    ]
++    model = _build_warehouse_waste(
++        warehouse_rows=warehouse_rows,
++        basis="estimated",
++        currency="USD",
++        convert=_waste_convert,
++        view_range=view_range,
++    )
++    assert [row.name for row in model.rows] == [
++        "WH0",
++        "WH1",
++        "WH2",
++        "WH3",
++        "WH4",
++    ]
++
++
++def test_warehouse_waste_empty_when_no_idle() -> None:
++    view_range = DashboardViewRange(
++        mode="custom",
++        window_days=None,
++        start_date=date(2026, 6, 1),
++        end_date=date(2026, 6, 1),
++    )
++    model = _build_warehouse_waste(
++        warehouse_rows=[
++            {
++                "usage_date": date(2026, 6, 1),
++                "warehouse_name": "BUSY",
++                "credits_used": 10.0,
++                "credits_used_compute": 10.0,
++                "credits_attributed_queries": 10.0,
++            }
++        ],
++        basis="estimated",
++        currency="USD",
++        convert=_waste_convert,
++        view_range=view_range,
++    )
++    assert model.is_empty is True
++    assert model.total_period_idle_spend == 0.0
++    assert model.rows[0].period_idle_spend == 0.0
+diff --git a/apps/web/src/components/dashboard/cost-dashboard.tsx b/apps/web/src/components/dashboard/cost-dashboard.tsx
+index 1697c42..5d96ad0 100644
+--- a/apps/web/src/components/dashboard/cost-dashboard.tsx
++++ b/apps/web/src/components/dashboard/cost-dashboard.tsx
+@@ -51,6 +51,7 @@ import {
+   type AiSpendDetailState,
+ } from "./spend-sections";
+ import { useSectionStatuses } from "./use-section-statuses";
++import { WasteEstimatorCard } from "./waste-estimator-card";
+ 
+ export type CostDashboardRuntime = {
+   accessToken: string | null;
+@@ -1176,6 +1177,11 @@ function CostDashboardContent({
+                       loadingMessage: loadingMessage ?? undefined,
+                     })}
+             />
++            {viewModel &&
++            dataReady &&
++            sectionStatuses.warehouse === "ready" ? (
++              <WasteEstimatorCard model={viewModel.warehouseWaste} />
++            ) : null}
+             <AiSpendSection
+               {...(sectionStatuses.overview === "idle"
+                 ? { status: "idle" as const }
+diff --git a/apps/web/src/components/dashboard/waste-estimator-card.test.tsx b/apps/web/src/components/dashboard/waste-estimator-card.test.tsx
+new file mode 100644
+index 0000000..aaaf4d2
+--- /dev/null
++++ b/apps/web/src/components/dashboard/waste-estimator-card.test.tsx
+@@ -0,0 +1,134 @@
++import { cleanup, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it } from "vitest";
++
++import type { WarehouseWasteViewModel } from "../../lib/dashboard-contracts";
++import { WasteEstimatorCard } from "./waste-estimator-card";
++
++afterEach(() => {
++  cleanup();
++});
++
++function wasteModel(
++  overrides: Partial<WarehouseWasteViewModel> = {},
++): WarehouseWasteViewModel {
++  return {
++    basis: "estimated",
++    totalPeriodIdleSpend: 150,
++    totalPeriodIdleSpendLabel: "$150.00",
++    totalProjectedMonthlyIdleSpend: 450,
++    totalProjectedMonthlyIdleSpendLabel: "$450.00",
++    rows: [
++      {
++        name: "BI_WH",
++        idlePct: 0.75,
++        periodIdleSpend: 100,
++        periodIdleSpendLabel: "$100.00",
++        projectedMonthlyIdleSpend: 300,
++        projectedMonthlyIdleSpendLabel: "$300.00",
++      },
++      {
++        name: "ETL_WH",
++        idlePct: 0.2,
++        periodIdleSpend: 50,
++        periodIdleSpendLabel: "$50.00",
++        projectedMonthlyIdleSpend: 150,
++        projectedMonthlyIdleSpendLabel: "$150.00",
++      },
++    ],
++    isEmpty: false,
++    ...overrides,
++  };
++}
++
++describe("WasteEstimatorCard", () => {
++  it("renders nothing when the prepared view reports no idle spend", () => {
++    const { container } = render(
++      <WasteEstimatorCard
++        model={wasteModel({ isEmpty: true, rows: [], totalPeriodIdleSpend: 0 })}
++      />,
++    );
++
++    expect(container.firstChild).toBeNull();
++    expect(
++      screen.queryByTestId("waste-estimator-auto-savings-cta"),
++    ).not.toBeInTheDocument();
++  });
++
++  it("preserves server-supplied row order instead of re-sorting client-side", () => {
++    render(
++      <WasteEstimatorCard
++        model={wasteModel({
++          rows: [
++            {
++              name: "SMALL_IDLE",
++              idlePct: 0.9,
++              periodIdleSpend: 10,
++              periodIdleSpendLabel: "$10.00",
++              projectedMonthlyIdleSpend: 30,
++              projectedMonthlyIdleSpendLabel: "$30.00",
++            },
++            {
++              name: "BIG_IDLE",
++              idlePct: 0.1,
++              periodIdleSpend: 200,
++              periodIdleSpendLabel: "$200.00",
++              projectedMonthlyIdleSpend: 600,
++              projectedMonthlyIdleSpendLabel: "$600.00",
++            },
++          ],
++        })}
++      />,
++    );
++
++    expect(
++      screen
++        .getAllByTestId("waste-estimator-row")
++        .map((row) => row.getAttribute("data-warehouse-name")),
++    ).toEqual(["SMALL_IDLE", "BIG_IDLE"]);
++  });
++
++  it("renders an em dash when idlePct is null instead of a numeric percentage", () => {
++    render(
++      <WasteEstimatorCard
++        model={wasteModel({
++          rows: [
++            {
++              name: "ADAPT_WH",
++              idlePct: null,
++              periodIdleSpend: 0,
++              periodIdleSpendLabel: "$0.00",
++              projectedMonthlyIdleSpend: 0,
++              projectedMonthlyIdleSpendLabel: "$0.00",
++            },
++          ],
++        })}
++      />,
++    );
++
++    const idlePct = screen.getByTestId("waste-estimator-idle-pct");
++    expect(idlePct).toHaveTextContent("–");
++    expect(idlePct.textContent).not.toMatch(/NaN/);
++    expect(idlePct.textContent).not.toMatch(/%/);
++  });
++
++  it("links the CTA to /automated-savings by default and to autoSavingsHref when set", () => {
++    const { rerender } = render(<WasteEstimatorCard model={wasteModel()} />);
++
++    expect(screen.getByTestId("waste-estimator-auto-savings-cta")).toHaveAttribute(
++      "href",
++      "/automated-savings",
++    );
++
++    rerender(
++      <WasteEstimatorCard
++        model={wasteModel()}
++        autoSavingsHref="/automated-savings?warehouse=BI_WH"
++      />,
++    );
++
++    expect(screen.getByTestId("waste-estimator-auto-savings-cta")).toHaveAttribute(
++      "href",
++      "/automated-savings?warehouse=BI_WH",
++    );
++  });
++});
+diff --git a/apps/web/src/components/dashboard/waste-estimator-card.tsx b/apps/web/src/components/dashboard/waste-estimator-card.tsx
+new file mode 100644
+index 0000000..65ded08
+--- /dev/null
++++ b/apps/web/src/components/dashboard/waste-estimator-card.tsx
+@@ -0,0 +1,104 @@
++"use client";
++
++import Link from "next/link";
++
++import type { WarehouseWasteViewModel } from "../../lib/dashboard-contracts";
++
++function cx(...classes: Array<string | undefined>): string {
++  return classes.filter(Boolean).join(" ");
++}
++
++export function WasteEstimatorCard({
++  model,
++  autoSavingsHref = "/automated-savings",
++}: {
++  model: WarehouseWasteViewModel;
++  autoSavingsHref?: string;
++}) {
++  if (model.isEmpty) {
++    return null;
++  }
++  return (
++    <section
++      aria-labelledby="waste-estimator-heading"
++      className="rounded-lg border border-hairline bg-slate-950/40 p-4 lg:p-6"
++    >
++      <header className="flex flex-wrap items-baseline justify-between gap-2">
++        <h2
++          id="waste-estimator-heading"
++          className="text-sm font-semibold text-slate-200"
++        >
++          Recoverable idle compute
++        </h2>
++        <p className="text-xs text-slate-400">
++          Idle credits × your compute rate, over the selected window.
++        </p>
++      </header>
++      <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
++        <Kpi
++          label="Idle spend this period"
++          value={model.totalPeriodIdleSpendLabel}
++        />
++        <Kpi
++          label="Projected monthly waste"
++          value={model.totalProjectedMonthlyIdleSpendLabel}
++        />
++      </div>
++      <ul className="mt-4 space-y-1 text-xs" role="list">
++        <li className="grid grid-cols-[minmax(0,8rem)_auto_auto_auto] gap-3 pb-1 text-[10px] uppercase tracking-wide text-slate-500">
++          <span>Warehouse</span>
++          <span className="text-right">Idle %</span>
++          <span className="text-right">Period</span>
++          <span className="text-right">Projected / mo</span>
++        </li>
++        {model.rows.map((row) => (
++          <li
++            key={row.name}
++            data-testid="waste-estimator-row"
++            data-warehouse-name={row.name}
++            className="grid grid-cols-[minmax(0,8rem)_auto_auto_auto] items-baseline gap-3 tabular-nums"
++          >
++            <span className="truncate text-slate-300" title={row.name}>
++              {row.name}
++            </span>
++            <span
++              className="text-right text-slate-400"
++              data-testid="waste-estimator-idle-pct"
++            >
++              {row.idlePct === null ? "–" : `${Math.round(row.idlePct * 100)}%`}
++            </span>
++            <span className="text-right text-slate-200">
++              {row.periodIdleSpendLabel}
++            </span>
++            <span className="text-right font-semibold text-slate-100">
++              {row.projectedMonthlyIdleSpendLabel}
++            </span>
++          </li>
++        ))}
++      </ul>
++      <Link
++        href={autoSavingsHref}
++        className={cx(
++          "mt-4 inline-flex items-center gap-2 rounded-md",
++          "bg-emerald-500/90 px-3 py-2 text-xs font-semibold text-slate-950",
++          "hover:bg-emerald-400 focus-visible:outline focus-visible:outline-2",
++          "focus-visible:outline-emerald-300",
++        )}
++        data-testid="waste-estimator-auto-savings-cta"
++      >
++        Reduce this waste with Auto Savings →
++      </Link>
++    </section>
++  );
++}
++
++function Kpi({ label, value }: { label: string; value: string }) {
++  return (
++    <div className="rounded-md border border-hairline bg-slate-950/60 p-3">
++      <p className="text-[10px] uppercase tracking-wide text-slate-500">{label}</p>
++      <p className="mt-1 text-lg font-semibold tabular-nums text-slate-100">
++        {value}
++      </p>
++    </div>
++  );
++}
+diff --git a/apps/web/src/lib/dashboard-contracts.test.ts b/apps/web/src/lib/dashboard-contracts.test.ts
+index 9c6ae63..6d573ae 100644
+--- a/apps/web/src/lib/dashboard-contracts.test.ts
++++ b/apps/web/src/lib/dashboard-contracts.test.ts
+@@ -376,6 +376,23 @@ describe("parseDashboardView", () => {
+     expect(parsed.detailTables.storage[0]?.monthlySpendLabel).toBe("$0.01");
+   });
+ 
++  it("defaults missing warehouse waste on older prepared dashboard views", () => {
++    const legacyPayload: Record<string, unknown> = { ...preparedViewPayload };
++    delete legacyPayload.warehouse_waste;
++
++    const parsed = parseDashboardView(legacyPayload);
++
++    expect(parsed.warehouseWaste).toEqual({
++      basis: "estimated",
++      totalPeriodIdleSpend: 0,
++      totalPeriodIdleSpendLabel: "$0.00",
++      totalProjectedMonthlyIdleSpend: 0,
++      totalProjectedMonthlyIdleSpendLabel: "$0.00",
++      rows: [],
++      isEmpty: true,
++    });
++  });
++
+   it("defaults missing capacity balance on older prepared dashboard views", () => {
+     const legacyPayload: Record<string, unknown> = { ...preparedViewPayload };
+     delete legacyPayload.capacity_balance;
+diff --git a/apps/web/src/lib/dashboard-contracts.ts b/apps/web/src/lib/dashboard-contracts.ts
+index c173ffe..09556fc 100644
+--- a/apps/web/src/lib/dashboard-contracts.ts
++++ b/apps/web/src/lib/dashboard-contracts.ts
+@@ -233,6 +233,25 @@ export type WarehouseSpendViewModel = {
+   isEmpty: boolean;
+ };
+ 
++export type WarehouseWasteRow = {
++  name: string;
++  idlePct: number | null;
++  periodIdleSpend: number;
++  periodIdleSpendLabel: string;
++  projectedMonthlyIdleSpend: number;
++  projectedMonthlyIdleSpendLabel: string;
++};
++
++export type WarehouseWasteViewModel = {
++  basis: SpendBasis;
++  totalPeriodIdleSpend: number;
++  totalPeriodIdleSpendLabel: string;
++  totalProjectedMonthlyIdleSpend: number;
++  totalProjectedMonthlyIdleSpendLabel: string;
++  rows: WarehouseWasteRow[];
++  isEmpty: boolean;
++};
++
+ export type StorageDatabaseRow = {
+   name: string;
+   bytes: number;
+@@ -335,6 +354,7 @@ export type DashboardView = {
+   capacityBalance: CapacityBalanceViewModel;
+   totalSpend: TotalSpendViewModel;
+   warehouseSpend: WarehouseSpendViewModel;
++  warehouseWaste: WarehouseWasteViewModel;
+   storageSpend: StorageSpendViewModel;
+   serviceSpend: ServiceSpendViewModel;
+   detailTables: DetailTablesViewModel;
+@@ -542,6 +562,11 @@ export function parseDashboardView(payload: unknown): DashboardView {
+     warehouseSpend: parseWarehouseSpendViewModel(
+       readViewRecord(payload, "warehouse_spend", "warehouseSpend"),
+     ),
++    warehouseWaste: hasViewValue(payload, "warehouse_waste", "warehouseWaste")
++      ? parseWarehouseWasteViewModel(
++          readViewRecord(payload, "warehouse_waste", "warehouseWaste"),
++        )
++      : emptyWarehouseWasteViewModel(),
+     storageSpend: parseStorageSpendViewModel(
+       readViewRecord(payload, "storage_spend", "storageSpend"),
+       header.currency,
+@@ -811,6 +836,18 @@ function emptyCapacityBalanceViewModel(
+   };
+ }
+ 
++function emptyWarehouseWasteViewModel(): WarehouseWasteViewModel {
++  return {
++    basis: "estimated",
++    totalPeriodIdleSpend: 0,
++    totalPeriodIdleSpendLabel: "$0.00",
++    totalProjectedMonthlyIdleSpend: 0,
++    totalProjectedMonthlyIdleSpendLabel: "$0.00",
++    rows: [],
++    isEmpty: true,
++  };
++}
++
+ function parseWarehouseSpendViewModel(
+   payload: Record<string, unknown>,
+ ): WarehouseSpendViewModel {
+@@ -1016,6 +1053,64 @@ function parseWarehouseIdleBarRow(payload: unknown): WarehouseIdleBarRow {
+   };
+ }
+ 
++function parseWarehouseWasteRow(payload: unknown): WarehouseWasteRow {
++  const record = asViewRecord(payload);
++  return {
++    name: readViewString(record, "name"),
++    idlePct: readViewNullableNumber(record, "idle_pct", "idlePct"),
++    periodIdleSpend: readViewNumber(
++      record,
++      "period_idle_spend",
++      "periodIdleSpend",
++    ),
++    periodIdleSpendLabel: readViewString(
++      record,
++      "period_idle_spend_label",
++      "periodIdleSpendLabel",
++    ),
++    projectedMonthlyIdleSpend: readViewNumber(
++      record,
++      "projected_monthly_idle_spend",
++      "projectedMonthlyIdleSpend",
++    ),
++    projectedMonthlyIdleSpendLabel: readViewString(
++      record,
++      "projected_monthly_idle_spend_label",
++      "projectedMonthlyIdleSpendLabel",
++    ),
++  };
++}
++
++function parseWarehouseWasteViewModel(
++  payload: Record<string, unknown>,
++): WarehouseWasteViewModel {
++  return {
++    basis: readViewSpendBasis(payload, "basis"),
++    totalPeriodIdleSpend: readViewNumber(
++      payload,
++      "total_period_idle_spend",
++      "totalPeriodIdleSpend",
++    ),
++    totalPeriodIdleSpendLabel: readViewString(
++      payload,
++      "total_period_idle_spend_label",
++      "totalPeriodIdleSpendLabel",
++    ),
++    totalProjectedMonthlyIdleSpend: readViewNumber(
++      payload,
++      "total_projected_monthly_idle_spend",
++      "totalProjectedMonthlyIdleSpend",
++    ),
++    totalProjectedMonthlyIdleSpendLabel: readViewString(
++      payload,
++      "total_projected_monthly_idle_spend_label",
++      "totalProjectedMonthlyIdleSpendLabel",
++    ),
++    rows: readViewArray(payload, "rows").map(parseWarehouseWasteRow),
++    isEmpty: readViewBoolean(payload, "is_empty", "isEmpty"),
++  };
++}
++
+ function parseStorageDatabaseRow(payload: unknown): StorageDatabaseRow {
+   const record = asViewRecord(payload);
+   const bytes = readViewNumber(record, "bytes");
+diff --git a/docs/warehouse-waste-estimator.md b/docs/warehouse-waste-estimator.md
+new file mode 100644
+index 0000000..8a43069
+--- /dev/null
++++ b/docs/warehouse-waste-estimator.md
+@@ -0,0 +1,60 @@
++# Warehouse waste estimator
++
++The dashboard already computes per-warehouse idle share as
++`credits_used_compute − credits_attributed_queries`. The waste estimator
++dollarizes that idle compute, projects it to a 30-day month, and links the
++result to Auto Savings enrollment. It reuses `warehouse_spend_daily`; there is
++no new Snowflake SQL source and no new writer.
++
++## Idle credits
++
++Idle credits for a warehouse over the selected window are:
++
++```
++idle = credits_used_compute − credits_attributed_queries
++```
++
++That matches `_warehouse_idle_pct` on the warehouse ranked bars. Dollar amounts
++are produced in `dashboard_view_builder._build_warehouse_waste` by converting
++each day's idle credits through the same rate index that prices
++`warehouse_spend`, so the two sections stay consistent to the cent.
++
++If any day in the window is missing `credits_attributed_queries` (adaptive
++warehouses on older Account Usage schemas), the whole warehouse's `idle_pct`
++collapses to `None` and its idle dollars are treated as zero. A partial
++attribution number would look precise and be wrong; the UI renders an em dash
++instead.
++
++`attributed > compute` (beyond float epsilon) is an impossible state and
++raises. Warehouses with zero compute in the window are dropped.
++
++## Monthly projection
++
++Projected monthly idle spend is:
++
++```
++period_idle_spend × (30 / window_days)
++```
++
++where `window_days` is the inclusive length of the selected view range. This is
++linear extrapolation of the observed idle rate, not a forecast: it does not
++model seasonality, AUTO_SUSPEND changes, or enrollment. A 7-day window with
++high idle will project a high monthly number even if that week was unusual.
++
++The table is capped at the top five warehouses by period idle spend. KPI totals
++sum those displayed rows.
++
++## Empty state
++
++When period idle spend across the capped rows is `<= 0`, the prepared view
++sets `is_empty=True` and the card renders nothing. That includes demo windows
++whose warehouses have no idle compute, fully attributed compute, or only
++null-attribution warehouses. Hiding the card avoids a CTA that would imply
++recoverable dollars that are not there.
++
++## Auto Savings CTA
++
++The card links to `/automated-savings`. Idle compute is the observation; Auto
++Savings is the in-product control loop that can suspend idle warehouses. The
++estimator does not mutate Snowflake and does not recommend an `AUTO_SUSPEND`
++value.
